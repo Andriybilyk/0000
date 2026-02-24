@@ -14,12 +14,24 @@ export interface Schedule {
   estimatedCost?: number;
 }
 
-export interface KilnStatus {
-  currentTemp: number;
+export interface ZoneStatus {
+  temp: number;
   setpoint: number;
-  state: 'idle' | 'heating' | 'holding' | 'cooling' | 'error' | 'autotune';
+  output: number; // 0-100%
+}
+
+export interface KilnStatus {
+  currentTemp: number; // Average or primary
+  setpoint: number;
+  state: 'idle' | 'delayed' | 'heating' | 'holding' | 'cooling' | 'error' | 'autotune';
   currentScheduleId?: string;
   currentStepIndex?: number;
   timeRemaining?: number;
+  delayRemaining?: number;
   error?: string;
+  relayCycles?: number;
+  tcOffset?: number;
+  zones?: ZoneStatus[];
+  safetyAlert?: string;
+  elementHealth?: number; // 0-100%
 }

@@ -9,6 +9,7 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <SPIFFS.h>
+#include <Preferences.h>
 #include <PID_v1.h>
 #include <PID_AutoTune_v0.h>
 #include <Adafruit_MAX31855.h> // Or MAX31856
@@ -37,6 +38,20 @@ AsyncWebSocket ws("/ws");
 double setpoint = 20.0, input = 20.0, output = 0.0;
 double Kp = 2.0, Ki = 5.0, Kd = 1.0;
 PID kilnPID(&input, &output, &setpoint, Kp, Ki, Kd, DIRECT);
+Preferences preferences;
+
+// Schedule Data Structure
+struct ScheduleStep {
+  String type; // "ramp", "hold", "cool"
+  double targetTemp;
+  double rate; // deg/hr
+  int duration; // mins
+};
+ScheduleStep currentSchedule[20];
+int numSteps = 0;
+int currentStepIndex = 0;
+unsigned long stepStartTime = 0;
+double startTemp = 20.0;
 
 // PID Autotune
 PID_ATune aTune(&input, &output);
@@ -45,9 +60,16 @@ double aTuneStep = 50, aTuneNoise = 1, aTuneStartValue = 100;
 unsigned int aTuneLookBack = 20;
 
 // State
-enum KilnState { IDLE, HEATING, HOLDING, COOLING, ERROR_STATE, AUTOTUNE };
+enum KilnState { IDLE, DELAYED, HEATING, HOLDING, COOLING, ERROR_STATE, AUTOTUNE };
 KilnState currentState = IDLE;
 String errorMessage = "";
+
+// Diagnostics & Settings
+double tcOffset = 0.0;
+unsigned long relayCycles = 0;
+bool ssrState = false;
+unsigned long delayStartTime = 0;
+unsigned long delayDurationMs = 0;
 
 // Time tracking for SSR PWM
 int windowSize = 5000; // 5 seconds
@@ -61,6 +83,7 @@ void handleSafety();
 void notifyClients();
 void startAutoTune();
 void finishAutoTune();
+void processSchedule();
 
 #if HAS_DISPLAY
 extern void setupDisplay();
@@ -80,6 +103,15 @@ void setup() {
   pinMode(SSR_PIN, OUTPUT);
   pinMode(DOOR_SWITCH_PIN, INPUT_PULLUP);
   
+  // Load PID settings from NVS
+  preferences.begin("kiln", false);
+  Kp = preferences.getDouble("Kp", 2.0);
+  Ki = preferences.getDouble("Ki", 5.0);
+  Kd = preferences.getDouble("Kd", 1.0);
+  tcOffset = preferences.getDouble("tcOffset", 0.0);
+  relayCycles = preferences.getULong("relayCycles", 0);
+  kilnPID.SetTunings(Kp, Ki, Kd);
+
   if (!thermocouple.begin()) {
     currentState = ERROR_STATE;
     errorMessage = "Thermocouple Error";
@@ -104,15 +136,25 @@ void loop() {
   handleSafety();
   
   if (currentState != ERROR_STATE) {
-    input = thermocouple.readCelsius();
+    input = thermocouple.readCelsius() + tcOffset;
     if (isnan(input)) {
       currentState = ERROR_STATE;
       errorMessage = "Thermocouple Read Error";
     } else {
-      updatePID();
+      if (currentState == DELAYED) {
+        if (millis() - delayStartTime >= delayDurationMs) {
+          currentState = HEATING; // Or whatever the first step is
+          stepStartTime = millis();
+          startTemp = input;
+        }
+      } else {
+        processSchedule();
+        updatePID();
+      }
     }
   } else {
     digitalWrite(SSR_PIN, LOW); // Fail-safe
+    ssrState = false;
   }
 
 #if HAS_DISPLAY
@@ -156,11 +198,16 @@ void updatePID() {
   if (now - windowStartTime > windowSize) {
     windowStartTime += windowSize;
   }
-  if (output > now - windowStartTime) {
-    digitalWrite(SSR_PIN, HIGH);
-  } else {
-    digitalWrite(SSR_PIN, LOW);
+  
+  bool newSsrState = (output > now - windowStartTime);
+  if (newSsrState && !ssrState) {
+    relayCycles++;
+    if (relayCycles % 1000 == 0) { // Save periodically to avoid flash wear
+      preferences.putULong("relayCycles", relayCycles);
+    }
   }
+  ssrState = newSsrState;
+  digitalWrite(SSR_PIN, ssrState ? HIGH : LOW);
 }
 
 void startAutoTune() {
@@ -177,9 +224,61 @@ void finishAutoTune() {
   Ki = aTune.GetKi();
   Kd = aTune.GetKd();
   kilnPID.SetTunings(Kp, Ki, Kd);
+  
+  // Save to NVS
+  preferences.putDouble("Kp", Kp);
+  preferences.putDouble("Ki", Ki);
+  preferences.putDouble("Kd", Kd);
+  
   currentState = IDLE;
   Serial.printf("Autotune complete. Kp: %.2f, Ki: %.2f, Kd: %.2f\n", Kp, Ki, Kd);
-  // Save to SPIFFS or EEPROM here
+}
+
+void processSchedule() {
+  if (currentState != HEATING && currentState != HOLDING && currentState != COOLING) return;
+  if (currentStepIndex >= numSteps) {
+    currentState = IDLE;
+    setpoint = 20.0; // Reset to ambient or safe temp
+    Serial.println("Schedule Complete!");
+    return;
+  }
+
+  ScheduleStep step = currentSchedule[currentStepIndex];
+  unsigned long now = millis();
+  unsigned long elapsedMs = now - stepStartTime;
+  double elapsedHours = elapsedMs / 3600000.0;
+  double elapsedMins = elapsedMs / 60000.0;
+
+  if (step.type == "ramp" || step.type == "cool") {
+    currentState = (step.type == "ramp") ? HEATING : COOLING;
+    double expectedTempChange = step.rate * elapsedHours;
+    
+    if (step.type == "ramp") {
+      setpoint = startTemp + expectedTempChange;
+      if (setpoint >= step.targetTemp) {
+        setpoint = step.targetTemp;
+        currentStepIndex++;
+        stepStartTime = millis();
+        startTemp = input;
+      }
+    } else { // cool
+      setpoint = startTemp - expectedTempChange;
+      if (setpoint <= step.targetTemp) {
+        setpoint = step.targetTemp;
+        currentStepIndex++;
+        stepStartTime = millis();
+        startTemp = input;
+      }
+    }
+  } else if (step.type == "hold") {
+    currentState = HOLDING;
+    setpoint = step.targetTemp;
+    if (elapsedMins >= step.duration) {
+      currentStepIndex++;
+      stepStartTime = millis();
+      startTemp = input;
+    }
+  }
 }
 
 void setupWiFi() {
@@ -201,7 +300,10 @@ void notifyClients() {
   doc["currentTemp"] = input;
   doc["setpoint"] = setpoint;
   doc["state"] = currentState;
+  doc["currentStep"] = currentStepIndex;
   doc["error"] = errorMessage;
+  doc["relayCycles"] = relayCycles;
+  doc["tcOffset"] = tcOffset;
   
   String output;
   serializeJson(doc, output);

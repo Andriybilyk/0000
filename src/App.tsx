@@ -1,10 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { LayoutDashboard, CalendarDays, FileCode2, BookOpen, Flame, Globe } from 'lucide-react';
+import { LayoutDashboard, CalendarDays, FileCode2, BookOpen, Flame, Globe, Settings2 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import EnhancedDashboard from './components/EnhancedDashboard';
 import ScheduleEditor from './components/ScheduleEditor';
 import CodeViewer from './components/CodeViewer';
 import Documentation from './components/Documentation';
+import Settings from './components/Settings';
 import { KilnStatus, Schedule } from './types';
 
 // Mock Data for UI
@@ -489,7 +490,7 @@ export const setupEnhancedApi = (app: Express, io: Server) => {
 
 export default function App() {
   const { t, i18n } = useTranslation();
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'schedules' | 'code' | 'docs'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'schedules' | 'code' | 'docs' | 'settings'>('dashboard');
   const [schedules, setSchedules] = useState<Schedule[]>(mockSchedules);
   
   // Mock Kiln Status State
@@ -498,40 +499,185 @@ export default function App() {
     setpoint: 0,
     state: 'idle',
     timeRemaining: 0,
+    relayCycles: 15420,
+    tcOffset: 0,
+    elementHealth: 85,
+    zones: [
+      { temp: 22.5, setpoint: 0, output: 0 },
+      { temp: 22.4, setpoint: 0, output: 0 },
+      { temp: 22.6, setpoint: 0, output: 0 }
+    ]
   });
 
   // Simulation effect for the dashboard graph
   useEffect(() => {
     let interval: NodeJS.Timeout;
-    if (status.state === 'heating') {
+    
+    if (status.state === 'delayed') {
       interval = setInterval(() => {
         setStatus(prev => {
-          const newTemp = prev.currentTemp + (Math.random() * 2 + 1);
-          if (newTemp >= prev.setpoint) {
-            return { ...prev, currentTemp: prev.setpoint, state: 'holding' };
+          if (prev.delayRemaining && prev.delayRemaining > 0) {
+            return { ...prev, delayRemaining: prev.delayRemaining - 1 };
+          } else {
+            // Start firing
+            const schedule = schedules.find(s => s.id === prev.currentScheduleId);
+            if (!schedule || schedule.steps.length === 0) return { ...prev, state: 'idle' };
+            const firstStep = schedule.steps[0];
+            return {
+              ...prev,
+              state: firstStep.type === 'ramp' ? 'heating' : 'cooling',
+              setpoint: prev.currentTemp,
+              currentStepIndex: 0,
+              timeRemaining: firstStep.type === 'hold' ? (firstStep.duration || 60) * 60 : 0,
+              delayRemaining: 0
+            };
           }
-          return { ...prev, currentTemp: newTemp };
         });
       }, 1000);
-    } else if (status.state === 'holding') {
+    } else if (status.state === 'heating' || status.state === 'holding' || status.state === 'cooling') {
       interval = setInterval(() => {
-        setStatus(prev => ({
-          ...prev,
-          currentTemp: prev.setpoint + (Math.random() * 2 - 1) // fluctuate around setpoint
-        }));
+        setStatus(prev => {
+          if (!prev.currentScheduleId || prev.currentStepIndex === undefined) return prev;
+          
+          const schedule = schedules.find(s => s.id === prev.currentScheduleId);
+          if (!schedule || !schedule.steps[prev.currentStepIndex]) return prev;
+
+          const currentStep = schedule.steps[prev.currentStepIndex];
+          let newTemp = prev.currentTemp;
+          let newSetpoint = prev.setpoint;
+          let newState = prev.state;
+          let newStepIndex = prev.currentStepIndex;
+          let newTimeRemaining = prev.timeRemaining;
+
+          // Simple simulation logic
+          if (currentStep.type === 'ramp' || currentStep.type === 'cool') {
+            newState = currentStep.type === 'ramp' ? 'heating' : 'cooling';
+            const target = currentStep.targetTemp;
+            const ratePerSec = (currentStep.rate || 100) / 3600; // deg per sec
+            
+            if (currentStep.type === 'ramp') {
+              newSetpoint = Math.min(prev.setpoint + ratePerSec * 50, target); // Speed up for demo
+              newTemp = Math.min(prev.currentTemp + ratePerSec * 45 + (Math.random() * 0.5 - 0.25), newSetpoint);
+              if (newSetpoint >= target && newTemp >= target - 1) {
+                newStepIndex++;
+              }
+            } else {
+              newSetpoint = Math.max(prev.setpoint - ratePerSec * 50, target);
+              newTemp = Math.max(prev.currentTemp - ratePerSec * 45 + (Math.random() * 0.5 - 0.25), newSetpoint);
+              if (newSetpoint <= target && newTemp <= target + 1) {
+                newStepIndex++;
+              }
+            }
+          } else if (currentStep.type === 'hold') {
+            newState = 'holding';
+            newSetpoint = currentStep.targetTemp;
+            // Add some noise to temp
+            newTemp = newSetpoint + (Math.random() * 1 - 0.5);
+            
+            if (newTimeRemaining && newTimeRemaining > 0) {
+              newTimeRemaining--;
+            } else {
+              newStepIndex++;
+            }
+          }
+
+          // Simulate multi-zone
+          const newZones = prev.zones?.map((z, i) => {
+            const noise = (Math.random() * 2 - 1) * (i + 1) * 0.5; // Different noise per zone
+            return {
+              temp: newTemp + noise,
+              setpoint: newSetpoint,
+              output: newState === 'heating' ? Math.min(100, Math.max(0, (newSetpoint - (newTemp + noise)) * 10)) : 0
+            };
+          });
+
+          // Simulate Safety Alert (Stuck Relay)
+          let newSafetyAlert = prev.safetyAlert;
+          if (newState === 'holding' && Math.random() < 0.02 && !newSafetyAlert) {
+            newSafetyAlert = 'stuckRelay';
+            newState = 'error';
+          }
+
+          // Check if schedule is complete
+          if (newStepIndex >= schedule.steps.length) {
+            return {
+              ...prev,
+              state: 'idle',
+              setpoint: 20,
+              currentStepIndex: undefined,
+              timeRemaining: 0,
+              zones: newZones
+            };
+          }
+
+          // If step changed, update time remaining for new step
+          if (newStepIndex !== prev.currentStepIndex) {
+            const nextStep = schedule.steps[newStepIndex];
+            if (nextStep.type === 'hold') {
+              newTimeRemaining = (nextStep.duration || 60) * 60; // in seconds
+            } else {
+              newTimeRemaining = 0; // Or calculate based on rate
+            }
+          }
+
+          return {
+            ...prev,
+            currentTemp: newTemp,
+            setpoint: newSetpoint,
+            state: newState,
+            currentStepIndex: newStepIndex,
+            timeRemaining: newTimeRemaining,
+            zones: newZones,
+            safetyAlert: newSafetyAlert
+          };
+        });
       }, 1000);
     }
     return () => clearInterval(interval);
-  }, [status.state, status.setpoint]);
+  }, [status.state, schedules]);
 
   const handleStart = () => {
+    // Start the first schedule in the list for demo purposes
+    const scheduleToRun = schedules[0];
+    if (!scheduleToRun || scheduleToRun.steps.length === 0) return;
+
+    const firstStep = scheduleToRun.steps[0];
+    
     setStatus({
       ...status,
-      state: 'heating',
-      setpoint: 1060, // Mock target
+      state: firstStep.type === 'ramp' ? 'heating' : 'cooling',
+      setpoint: status.currentTemp, // Start from current temp
+      currentScheduleId: scheduleToRun.id,
       currentStepIndex: 0,
-      timeRemaining: 360,
+      timeRemaining: firstStep.type === 'hold' ? (firstStep.duration || 60) * 60 : 0,
     });
+  };
+
+  const handleDelayStart = (seconds: number) => {
+    if (seconds <= 0) return;
+    const scheduleToRun = schedules[0];
+    if (!scheduleToRun || scheduleToRun.steps.length === 0) return;
+
+    setStatus({
+      ...status,
+      state: 'delayed',
+      currentScheduleId: scheduleToRun.id,
+      delayRemaining: seconds,
+    });
+  };
+
+  const handleAddTime = () => {
+    setStatus(prev => ({
+      ...prev,
+      timeRemaining: (prev.timeRemaining || 0) + 300 // Add 5 mins (300s)
+    }));
+  };
+
+  const handleAddTemp = () => {
+    setStatus(prev => ({
+      ...prev,
+      setpoint: prev.setpoint + 5
+    }));
   };
 
   const handleStop = () => {
@@ -579,6 +725,10 @@ export default function App() {
     setSchedules(prev => prev.filter(s => s.id !== id));
   };
 
+  const handleUpdateOffset = (offset: number) => {
+    setStatus(prev => ({ ...prev, tcOffset: offset }));
+  };
+
   return (
     <div className="min-h-screen bg-black text-zinc-100 font-sans selection:bg-emerald-500/30">
       {/* Top Navigation */}
@@ -617,6 +767,12 @@ export default function App() {
               >
                 <BookOpen size={16} /> <span className="hidden sm:inline">{t('docs')}</span>
               </button>
+              <button 
+                onClick={() => setActiveTab('settings')}
+                className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors flex items-center space-x-2 ${activeTab === 'settings' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50'}`}
+              >
+                <Settings2 size={16} /> <span className="hidden sm:inline">{t('settings')}</span>
+              </button>
               
               <div className="pl-4 ml-2 border-l border-zinc-800 flex items-center">
                 <button 
@@ -636,7 +792,16 @@ export default function App() {
       {/* Main Content Area */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {activeTab === 'dashboard' && (
-          <EnhancedDashboard status={status} onStart={handleStart} onStop={handleStop} onSkip={handleSkip} onAutotune={handleAutotune} />
+          <EnhancedDashboard 
+            status={status} 
+            onStart={handleStart} 
+            onDelayStart={handleDelayStart}
+            onStop={handleStop} 
+            onSkip={handleSkip} 
+            onAutotune={handleAutotune} 
+            onAddTime={handleAddTime}
+            onAddTemp={handleAddTemp}
+          />
         )}
         {activeTab === 'schedules' && (
           <ScheduleEditor schedules={schedules} onSave={handleSaveSchedule} onDelete={handleDeleteSchedule} />
@@ -646,6 +811,14 @@ export default function App() {
         )}
         {activeTab === 'docs' && (
           <Documentation />
+        )}
+        {activeTab === 'settings' && (
+          <Settings 
+            tcOffset={status.tcOffset || 0} 
+            relayCycles={status.relayCycles || 0} 
+            elementHealth={status.elementHealth}
+            onUpdateOffset={handleUpdateOffset} 
+          />
         )}
       </main>
     </div>
